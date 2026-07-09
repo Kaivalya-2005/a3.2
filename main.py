@@ -38,9 +38,14 @@ async def answer_image(payload: ImageQARequest):
 
     try:
         # Prepare the image payload for Gemini
+        raw_base64 = payload.image_base64
+        if "," in raw_base64:
+            raw_base64 = raw_base64.split(",")[1]
+
+        # Prepare the image payload for Gemini
         image_part = {
-            "mime_type": "image/jpeg", # Gemini automatically handles png/jpeg via base64
-            "data": payload.image_base64
+            "mime_type": "image/jpeg", 
+            "data": raw_base64
         }
         
         # We use gemini-1.5-flash as it is the fastest and most cost-effective for multimodal QA
