@@ -193,10 +193,12 @@ async def dynamic_extract(payload: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Dynamic extraction failed: {str(e)}")
 
-from typing import Dict, List, Any
+import asyncio
+import json
+import base64
 
 # =====================================================================
-# TASK 4: Korean Audio Dataset API (Corrected Language Rules)
+# TASK 4: Korean Audio Dataset API (With Rate Limit Retries)
 # =====================================================================
 
 class AudioRequest(BaseModel):
@@ -214,12 +216,11 @@ async def analyze_audio(payload: AudioRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 audio string")
 
-    # 2. UPDATED INSTRUCTION: Enforce strict Korean for values
     audio_instruction = (
         "You are an expert multilingual data analyst. "
         "Listen to the provided Korean audio file, which describes a dataset and its statistical properties. "
         "Extract the statistical values mentioned in the audio and map them strictly to the requested JSON format. "
-        "CRITICAL RULE: While the JSON keys must remain exactly as listed below (in English), any string values extracted from the audio (such as column names, allowed values, or categorical data) MUST remain in their original Korean. Do NOT translate spoken Korean terms into English (e.g., if the audio says '키', output '키', not 'height'). "
+        "CRITICAL RULE: While the JSON keys must remain exactly as listed below (in English), any string values extracted from the audio (such as column names, allowed values, or categorical data) MUST remain in their original Korean. Do NOT translate spoken Korean terms into English. "
         "For mathematical values, map them correctly to mean, std, variance, etc. "
         "IMPORTANT: Your response MUST be a valid JSON object with EXACTLY the following structure. "
         "If a specific statistic is not mentioned, use an empty dictionary {} or array [].\n\n"
@@ -241,28 +242,39 @@ async def analyze_audio(payload: AudioRequest):
         "}"
     )
 
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[
-                types.Part.from_bytes(data=audio_bytes, mime_type='audio/mp3'), 
-                audio_instruction
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0, 
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[
+                    types.Part.from_bytes(data=audio_bytes, mime_type='audio/mp3'), 
+                    audio_instruction
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0, 
+                )
             )
-        )
-        
-        raw_text = response.text.strip()
-        if raw_text.startswith("```"):
-            lines = raw_text.splitlines()
-            if lines[0].startswith("```json"):
-                raw_text = "\n".join(lines[1:-1]).strip()
-            else:
-                raw_text = "\n".join(lines[1:-1]).strip()
+            
+            raw_text = response.text.strip()
+            if raw_text.startswith("```"):
+                lines = raw_text.splitlines()
+                if lines[0].startswith("```json"):
+                    raw_text = "\n".join(lines[1:-1]).strip()
+                else:
+                    raw_text = "\n".join(lines[1:-1]).strip()
 
-        return json.loads(raw_text)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")
+            return json.loads(raw_text)
+            
+        except Exception as e:
+            error_msg = str(e)
+            # If we hit a quota error, wait and try again
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                if attempt < max_retries - 1:
+                    # Sleep for 2, 4, 8, 16 seconds progressively
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+            
+            # If it's a different error or we ran out of retries, throw the 500
+            raise HTTPException(status_code=500, detail=f"Audio processing failed: {error_msg}")
