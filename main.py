@@ -1,76 +1,71 @@
+import base64
 import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
-# 1. Initialize FastAPI app
-app = FastAPI(title="Multimodal QA API")
+app = FastAPI(title="IITM Multimodal QA API")
 
-# 2. Enable CORS (Crucial for Cloudflare Worker grader)
+# 1. Enable CORS (Required by the Cloudflare Worker Grader)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 3. Define Request and Response Schemas
-class ImageQARequest(BaseModel):
+# 2. Setup Gemini Client (Requires GEMINI_API_KEY environment variable)
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# 3. Define the exact schemas expected by the grader
+class QARequest(BaseModel):
     image_base64: str
     question: str
 
-class ImageQAResponse(BaseModel):
+class QAResponse(BaseModel):
     answer: str
 
-# Configure Gemini API (Ensure GEMINI_API_KEY is set in your environment variables)
-# genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+# 4. The Endpoint exactly as specified
+@app.post("/answer-image", response_model=QAResponse)
+async def answer_image(payload: QARequest):
+    try:
+        # Strip any Base64 headers (e.g., "data:image/png;base64,") if the grader includes them
+        b64_string = payload.image_base64
+        if "," in b64_string:
+            b64_string = b64_string.split(",")[1]
+            
+        image_bytes = base64.b64decode(b64_string)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid base64 string")
 
-@app.post("/answer-image", response_model=ImageQAResponse)
-async def answer_image(payload: ImageQARequest):
-    # Ensure API key is available
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured on server.")
-    
-    genai.configure(api_key=api_key)
+    # Strict instructions to enforce the grader's formatting rules
+    system_instruction = (
+        "You are a strict data extraction assistant. "
+        "Answer the user's question based on the provided image. "
+        "CRITICAL RULE: If the answer is a numeric value (like a total, price, or score), "
+        "you MUST return ONLY the raw number. Do NOT include currency symbols (like $ or ₹), "
+        "units, or commas. Return just the digits and decimals (e.g., '4089.35')."
+    )
 
     try:
-        # Prepare the image payload for Gemini
-        raw_base64 = payload.image_base64
-        if "," in raw_base64:
-            raw_base64 = raw_base64.split(",")[1]
-
-        # Prepare the image payload for Gemini
-        image_part = {
-            "mime_type": "image/jpeg", 
-            "data": raw_base64
-        }
-        
-        # We use gemini-1.5-flash as it is the fastest and most cost-effective for multimodal QA
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        # Strict prompt engineering to satisfy grader constraints
-        system_instructions = (
-            "You are a strict data extraction bot. Answer the user's question based ONLY on the provided image. "
-            "CRITICAL RULES: \n"
-            "1. If the answer is numeric, return ONLY the raw number as a string. \n"
-            "2. DO NOT include units, currency symbols (e.g., $, ₹), or commas. \n"
-            "3. DO NOT use full sentences or conversational text. \n"
-            "4. Just return the exact value requested."
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type='image/png'),
+                payload.question
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.0, # Keep temperature 0 for factual extraction
+            )
         )
         
-        prompt = f"{system_instructions}\n\nQuestion: {payload.question}"
-        
-        # Call the model
-        response = model.generate_content([image_part, prompt])
-        
-        # Strip any accidental whitespace or hidden newline characters
-        extracted_answer = response.text.strip()
-        
-        return {"answer": extracted_answer}
-        
+        # Clean up the output string to ensure it's just the answer
+        clean_answer = response.text.strip().replace("`", "").replace('"', '')
+        return QAResponse(answer=clean_answer)
+
     except Exception as e:
-        print(f"Error processing image: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error during image processing.")
+        raise HTTPException(status_code=500, detail=str(e))
