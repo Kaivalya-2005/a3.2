@@ -196,30 +196,15 @@ async def dynamic_extract(payload: dict):
 from typing import Dict, List, Any
 
 # =====================================================================
-# TASK 4: Korean Audio Dataset API
+# TASK 4: Korean Audio Dataset API (Corrected)
 # =====================================================================
 
 class AudioRequest(BaseModel):
     audio_id: str
     audio_base64: str
 
-# This precisely matches the 13 keys from the Japanese/Korean prompt debugger
-class AudioStatsResponse(BaseModel):
-    rows: int
-    columns: List[str]
-    mean: Dict[str, Any]
-    std: Dict[str, Any]
-    variance: Dict[str, Any]
-    min: Dict[str, Any]
-    max: Dict[str, Any]
-    median: Dict[str, Any]
-    mode: Dict[str, Any]
-    range: Dict[str, Any]
-    allowed_values: Dict[str, Any]
-    value_range: Dict[str, Any]
-    correlation: List[Any]
-
-@app.post("/analyze-audio", response_model=AudioStatsResponse)
+# We removed the strict response_model from the decorator to avoid Pydantic/Gemini conflicts
+@app.post("/analyze-audio")
 async def analyze_audio(payload: AudioRequest):
     try:
         # 1. Clean and decode the base64 audio
@@ -231,27 +216,42 @@ async def analyze_audio(payload: AudioRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 audio string")
 
-    # 2. Instruct Gemini to listen to the Korean audio and map it to our stats schema
+    # 2. Instruct Gemini with the EXACT JSON structure inside the prompt
     audio_instruction = (
         "You are an expert multilingual data analyst. "
         "Listen to the provided Korean audio file, which describes a dataset and its statistical properties. "
-        "Extract the statistical values mentioned in the audio and map them strictly to the requested JSON schema. "
-        "Translate the concepts accurately to fill in fields like mean, std (standard deviation), variance, etc. "
-        "If a specific statistic is not mentioned in the audio, return an empty dictionary {} or array [] as appropriate for that field."
+        "Extract the statistical values mentioned in the audio and map them strictly to the requested JSON format. "
+        "Translate the concepts accurately to fill in fields like mean, std (standard deviation), variance, min, max, etc. "
+        "IMPORTANT: Your response MUST be a valid JSON object with EXACTLY the following structure. "
+        "If a specific statistic is not mentioned, use an empty dictionary {} or array [].\n\n"
+        "Required JSON Structure:\n"
+        "{\n"
+        '  "rows": 0,\n'
+        '  "columns": [],\n'
+        '  "mean": {},\n'
+        '  "std": {},\n'
+        '  "variance": {},\n'
+        '  "min": {},\n'
+        '  "max": {},\n'
+        '  "median": {},\n'
+        '  "mode": {},\n'
+        '  "range": {},\n'
+        '  "allowed_values": {},\n'
+        '  "value_range": {},\n'
+        '  "correlation": []\n'
+        "}"
     )
 
     try:
-        # 3. Use Gemini's multimodal audio capabilities
+        # 3. Use JSON mode WITHOUT the strict schema object
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[
-                # We use audio/mp3 as a safe default; Gemini natively processes the binary
                 types.Part.from_bytes(data=audio_bytes, mime_type='audio/mp3'), 
                 audio_instruction
             ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=AudioStatsResponse,
                 temperature=0.0, # Zero temperature to prevent hallucinated math
             )
         )
@@ -260,11 +260,14 @@ async def analyze_audio(payload: AudioRequest):
         raw_text = response.text.strip()
         if raw_text.startswith("```"):
             lines = raw_text.splitlines()
-            raw_text = "\n".join(lines[1:-1]).strip()
+            if lines[0].startswith("```json"):
+                raw_text = "\n".join(lines[1:-1]).strip()
+            else:
+                raw_text = "\n".join(lines[1:-1]).strip()
 
-        # Parse and return the structured data
-        parsed_json = json.loads(raw_text)
-        return AudioStatsResponse.model_validate(parsed_json)
+        # Parse and return the standard python dictionary 
+        # FastAPI will automatically convert this to a clean JSON response
+        return json.loads(raw_text)
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")
