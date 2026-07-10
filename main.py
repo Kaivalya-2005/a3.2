@@ -17,8 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Setup Gemini Client (Requires GEMINI_API_KEY environment variable)
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# 2. Setup Gemini Client 
+# (It will automatically pick up the GEMINI_API_KEY environment variable)
+client = genai.Client()
 
 # 3. Define the exact schemas expected by the grader
 class QARequest(BaseModel):
@@ -38,7 +39,7 @@ async def answer_image(payload: QARequest):
             b64_string = b64_string.split(",")[1]
             
         image_bytes = base64.b64decode(b64_string)
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 string")
 
     # Strict instructions to enforce the grader's formatting rules
