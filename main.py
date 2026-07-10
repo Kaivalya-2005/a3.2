@@ -192,3 +192,79 @@ async def dynamic_extract(payload: dict):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Dynamic extraction failed: {str(e)}")
+
+from typing import Dict, List, Any
+
+# =====================================================================
+# TASK 4: Korean Audio Dataset API
+# =====================================================================
+
+class AudioRequest(BaseModel):
+    audio_id: str
+    audio_base64: str
+
+# This precisely matches the 13 keys from the Japanese/Korean prompt debugger
+class AudioStatsResponse(BaseModel):
+    rows: int
+    columns: List[str]
+    mean: Dict[str, Any]
+    std: Dict[str, Any]
+    variance: Dict[str, Any]
+    min: Dict[str, Any]
+    max: Dict[str, Any]
+    median: Dict[str, Any]
+    mode: Dict[str, Any]
+    range: Dict[str, Any]
+    allowed_values: Dict[str, Any]
+    value_range: Dict[str, Any]
+    correlation: List[Any]
+
+@app.post("/analyze-audio", response_model=AudioStatsResponse)
+async def analyze_audio(payload: AudioRequest):
+    try:
+        # 1. Clean and decode the base64 audio
+        b64_string = payload.audio_base64
+        if "," in b64_string:
+            b64_string = b64_string.split(",")[1]
+            
+        audio_bytes = base64.b64decode(b64_string)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 audio string")
+
+    # 2. Instruct Gemini to listen to the Korean audio and map it to our stats schema
+    audio_instruction = (
+        "You are an expert multilingual data analyst. "
+        "Listen to the provided Korean audio file, which describes a dataset and its statistical properties. "
+        "Extract the statistical values mentioned in the audio and map them strictly to the requested JSON schema. "
+        "Translate the concepts accurately to fill in fields like mean, std (standard deviation), variance, etc. "
+        "If a specific statistic is not mentioned in the audio, return an empty dictionary {} or array [] as appropriate for that field."
+    )
+
+    try:
+        # 3. Use Gemini's multimodal audio capabilities
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                # We use audio/mp3 as a safe default; Gemini natively processes the binary
+                types.Part.from_bytes(data=audio_bytes, mime_type='audio/mp3'), 
+                audio_instruction
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=AudioStatsResponse,
+                temperature=0.0, # Zero temperature to prevent hallucinated math
+            )
+        )
+        
+        # 4. Clean up any markdown codeblock backticks if present
+        raw_text = response.text.strip()
+        if raw_text.startswith("```"):
+            lines = raw_text.splitlines()
+            raw_text = "\n".join(lines[1:-1]).strip()
+
+        # Parse and return the structured data
+        parsed_json = json.loads(raw_text)
+        return AudioStatsResponse.model_validate(parsed_json)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")
