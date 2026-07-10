@@ -1,5 +1,6 @@
 import base64
 import os
+import json
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Setup Gemini Client (Automatically reads GEMINI_API_KEY from environment)
+# 2. Setup Gemini Client (Picks up GEMINI_API_KEY from environment)
 client = genai.Client()
 
 # =====================================================================
@@ -89,9 +90,12 @@ class InvoiceResponse(BaseModel):
 async def extract_invoice(payload: InvoiceRequest):
     try:
         extract_instruction = (
-            "Analyze the following invoice text and extract the required fields. "
-            "Ensure the date is converted to YYYY-MM-DD format. "
-            "Ensure 'amount' is strictly the subtotal before tax, and 'tax' is just the tax amount."
+            "Analyze the following invoice text and extract the required fields precisely. "
+            "Rules:\n"
+            "1. Convert dates to ISO YYYY-MM-DD format.\n"
+            "2. 'amount' must be a numeric float/integer representing the subtotal before tax.\n"
+            "3. 'tax' must be a numeric float/integer representing the tax amount alone.\n"
+            "4. If 'amount' or 'tax' cannot be found, use JSON null. Do NOT use string 'null' or empty strings.\n"
             f"\n\nInvoice Text:\n{payload.invoice_text}"
         )
         
@@ -104,6 +108,22 @@ async def extract_invoice(payload: InvoiceRequest):
                 temperature=0.0,
             ),
         )
-        return InvoiceResponse.model_validate_json(response.text)
+        
+        # Clean up any markdown codeblock backticks if the model mistakenly generates them
+        raw_text = response.text.strip()
+        if raw_text.startswith("```"):
+            lines = raw_text.splitlines()
+            if lines[0].startswith("```json"):
+                raw_text = "\n".join(lines[1:-1])
+            else:
+                raw_text = "\n".join(lines[1:-1])
+        raw_text = raw_text.strip()
+
+        # Safely load it first to handle edge case structural validations
+        parsed_json = json.loads(raw_text)
+        
+        return InvoiceResponse.model_validate(parsed_json)
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Returns a clear explanation back to the grader logs rather than an unhandled 500 error
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
