@@ -1,10 +1,10 @@
 import base64
 import os
 import json
-from typing import Optional
+from typing import Optional, List, Type
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 # Modern Google GenAI SDK
 from google import genai
@@ -12,7 +12,7 @@ from google.genai import types
 
 app = FastAPI(title="IITM Combined Grading Cell API")
 
-# 1. Enable CORS for both Cloudflare Worker graders
+# 1. Enable CORS for all Cloudflare Worker graders
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Setup Gemini Client (Picks up GEMINI_API_KEY from environment)
+# 2. Setup Gemini Client 
 client = genai.Client()
 
 # =====================================================================
@@ -48,8 +48,8 @@ async def answer_image(payload: QARequest):
     qa_instruction = (
         "You are a strict data extraction assistant. "
         "Answer the user's question based on the provided image. "
-        "CRITICAL RULE: If the answer is a numeric value (like a total, price, or score), "
-        "you MUST return ONLY the raw number. Do NOT include currency symbols (like $ or ₹), "
+        "CRITICAL RULE: If the answer is a numeric value, "
+        "you MUST return ONLY the raw number. Do NOT include currency symbols, "
         "units, or commas. Return just the digits and decimals (e.g., '4089.35')."
     )
 
@@ -79,23 +79,20 @@ class InvoiceRequest(BaseModel):
     invoice_text: str
 
 class InvoiceResponse(BaseModel):
-    invoice_no: Optional[str] = Field(None, description="The invoice number. Null if not found.")
-    date: Optional[str] = Field(None, description="The date strictly in YYYY-MM-DD format. Null if not found.")
-    vendor: Optional[str] = Field(None, description="The name of the vendor or issuing company. Null if not found.")
-    amount: Optional[float] = Field(None, description="The subtotal amount BEFORE tax. Null if not found.")
-    tax: Optional[float] = Field(None, description="The tax amount only. Null if not found.")
-    currency: Optional[str] = Field(None, description="The currency (e.g., INR, USD). Null if not found.")
+    invoice_no: Optional[str] = Field(None)
+    date: Optional[str] = Field(None)
+    vendor: Optional[str] = Field(None)
+    amount: Optional[float] = Field(None)
+    tax: Optional[float] = Field(None)
+    currency: Optional[str] = Field(None)
 
 @app.post("/extract", response_model=InvoiceResponse)
 async def extract_invoice(payload: InvoiceRequest):
     try:
         extract_instruction = (
             "Analyze the following invoice text and extract the required fields precisely. "
-            "Rules:\n"
-            "1. Convert dates to ISO YYYY-MM-DD format.\n"
-            "2. 'amount' must be a numeric float/integer representing the subtotal before tax.\n"
-            "3. 'tax' must be a numeric float/integer representing the tax amount alone.\n"
-            "4. If 'amount' or 'tax' cannot be found, use JSON null. Do NOT use string 'null' or empty strings.\n"
+            "Convert dates to ISO YYYY-MM-DD. 'amount' is subtotal before tax. "
+            "If a field cannot be found, use JSON null."
             f"\n\nInvoice Text:\n{payload.invoice_text}"
         )
         
@@ -109,21 +106,89 @@ async def extract_invoice(payload: InvoiceRequest):
             ),
         )
         
-        # Clean up any markdown codeblock backticks if the model mistakenly generates them
         raw_text = response.text.strip()
         if raw_text.startswith("```"):
             lines = raw_text.splitlines()
-            if lines[0].startswith("```json"):
-                raw_text = "\n".join(lines[1:-1])
-            else:
-                raw_text = "\n".join(lines[1:-1])
-        raw_text = raw_text.strip()
-
-        # Safely load it first to handle edge case structural validations
-        parsed_json = json.loads(raw_text)
+            raw_text = "\n".join(lines[1:-1])
         
-        return InvoiceResponse.model_validate(parsed_json)
+        return InvoiceResponse.model_validate_json(raw_text.strip())
         
     except Exception as e:
-        # Returns a clear explanation back to the grader logs rather than an unhandled 500 error
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+
+
+# =====================================================================
+# TASK 3: Dynamic Schema Extraction (DataBridge Inc.)
+# =====================================================================
+
+def create_dynamic_model(schema_dict: dict) -> Type[BaseModel]:
+    """Dynamically builds a Pydantic model based on the requested JSON schema types."""
+    type_mapping = {
+        "string": str,
+        "integer": int,
+        "float": float,
+        "boolean": bool,
+        "date": str,
+        "array[string]": List[str],
+        "array[integer]": List[int]
+    }
+    
+    fields = {}
+    for key, field_type in schema_dict.items():
+        # Map the requested string type to an actual Python type, defaulting to str
+        py_type = type_mapping.get(field_type, str)
+        
+        # Add special formatting hints into the Pydantic description
+        desc = "Return JSON null if the value is missing."
+        if field_type == "date":
+            desc = "ISO format YYYY-MM-DD. Return JSON null if missing."
+            
+        # All fields are optional (default=None) so Pydantic safely handles missing data by outputting null
+        fields[key] = (Optional[py_type], Field(default=None, description=desc))
+        
+    return create_model('DynamicSchemaModel', **fields)
+
+
+@app.post("/dynamic-extract")
+async def dynamic_extract(payload: dict):
+    try:
+        text = payload.get("text", "")
+        schema_dict = payload.get("schema", {})
+        
+        # 1. Build the dynamic schema class
+        DynamicModel = create_dynamic_model(schema_dict)
+        
+        # 2. Instruct the model
+        instruction = (
+            "You are a dynamic ETL parsing agent. Extract data from the provided text to exactly match the requested schema. "
+            "Rules:\n"
+            "1. Return ONLY the keys requested in the schema.\n"
+            "2. If a value is missing, return JSON null (not the string 'null').\n"
+            "3. Dates must be formatted as YYYY-MM-DD.\n"
+            f"\nText to parse:\n{text}"
+        )
+        
+        # 3. Request structured output matching the dynamic Pydantic class
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=instruction,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=DynamicModel,
+                temperature=0.0,
+            ),
+        )
+        
+        # 4. Clean up any markdown blocks
+        raw_text = response.text.strip()
+        if raw_text.startswith("```"):
+            lines = raw_text.splitlines()
+            raw_text = "\n".join(lines[1:-1]).strip()
+
+        # 5. Validate through Pydantic and dump to a dictionary.
+        # This guarantees exactly the keys requested are present, and missing ones are natively `null`.
+        validated_data = DynamicModel.model_validate_json(raw_text)
+        return validated_data.model_dump()
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Dynamic extraction failed: {str(e)}")
