@@ -196,18 +196,16 @@ async def dynamic_extract(payload: dict):
 from typing import Dict, List, Any
 
 # =====================================================================
-# TASK 4: Korean Audio Dataset API (Corrected)
+# TASK 4: Korean Audio Dataset API (Corrected Language Rules)
 # =====================================================================
 
 class AudioRequest(BaseModel):
     audio_id: str
     audio_base64: str
 
-# We removed the strict response_model from the decorator to avoid Pydantic/Gemini conflicts
 @app.post("/analyze-audio")
 async def analyze_audio(payload: AudioRequest):
     try:
-        # 1. Clean and decode the base64 audio
         b64_string = payload.audio_base64
         if "," in b64_string:
             b64_string = b64_string.split(",")[1]
@@ -216,12 +214,13 @@ async def analyze_audio(payload: AudioRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 audio string")
 
-    # 2. Instruct Gemini with the EXACT JSON structure inside the prompt
+    # 2. UPDATED INSTRUCTION: Enforce strict Korean for values
     audio_instruction = (
         "You are an expert multilingual data analyst. "
         "Listen to the provided Korean audio file, which describes a dataset and its statistical properties. "
         "Extract the statistical values mentioned in the audio and map them strictly to the requested JSON format. "
-        "Translate the concepts accurately to fill in fields like mean, std (standard deviation), variance, min, max, etc. "
+        "CRITICAL RULE: While the JSON keys must remain exactly as listed below (in English), any string values extracted from the audio (such as column names, allowed values, or categorical data) MUST remain in their original Korean. Do NOT translate spoken Korean terms into English (e.g., if the audio says '키', output '키', not 'height'). "
+        "For mathematical values, map them correctly to mean, std, variance, etc. "
         "IMPORTANT: Your response MUST be a valid JSON object with EXACTLY the following structure. "
         "If a specific statistic is not mentioned, use an empty dictionary {} or array [].\n\n"
         "Required JSON Structure:\n"
@@ -243,7 +242,6 @@ async def analyze_audio(payload: AudioRequest):
     )
 
     try:
-        # 3. Use JSON mode WITHOUT the strict schema object
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[
@@ -252,11 +250,10 @@ async def analyze_audio(payload: AudioRequest):
             ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.0, # Zero temperature to prevent hallucinated math
+                temperature=0.0, 
             )
         )
         
-        # 4. Clean up any markdown codeblock backticks if present
         raw_text = response.text.strip()
         if raw_text.startswith("```"):
             lines = raw_text.splitlines()
@@ -265,8 +262,6 @@ async def analyze_audio(payload: AudioRequest):
             else:
                 raw_text = "\n".join(lines[1:-1]).strip()
 
-        # Parse and return the standard python dictionary 
-        # FastAPI will automatically convert this to a clean JSON response
         return json.loads(raw_text)
         
     except Exception as e:
